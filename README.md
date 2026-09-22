@@ -147,9 +147,11 @@ confirmed observations only. An unknown tram or train code is displayed raw, for
 example `Train (line 21)`, rather than guessed; metro and bus codes do match the
 commercial numbering, with the metro "bis" lines offset by 100.
 
-Contributions to that table are welcome. Save a scan made right after a trip on
-a line you can identify with certainty, ideally validated at a station served by
-a single line, then run:
+## Want to help us cover the IDFM network?
+
+The table only grows with observations, and one card cannot travel every line.
+Save a scan made right after a trip on a line you can identify with certainty,
+ideally validated at a station served by a single line, then run:
 
 ```
 python3 tools/navigo_decode.py <save.nfc>
@@ -157,7 +159,15 @@ python3 tools/navigo_decode.py <save.nfc>
 
 It prints the raw Intercode fields of each event next to the line the app would
 display, so the transport type and route number to add to the table can be read
-off directly.
+off directly. Send them over in an issue, or open a pull request adding the
+entry to `NAVIGO_LINE_NAMES`.
+
+[docs/navigo-line-survey.md](docs/navigo-line-survey.md) is the survey plan: a
+single-line station for every metro, RER and Transilien line, the tram and bus
+cases, and a column to fill in as codes come in. Two constraints worth knowing
+before setting out: a gate records its own line rather than the line you ride,
+and the card only keeps the last three events, so scan at least every three
+validations.
 
 ---
 
