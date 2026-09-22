@@ -94,6 +94,73 @@ This is a list of metro cards and transit systems that need support or have part
 
 ---
 
+# Notes on this fork
+
+## Phone-emulated cards (Apple Wallet, Google Wallet)
+
+A Navigo held in Apple Wallet (iPhone, Apple Watch) or Google Wallet is read like
+a plastic one: hold the phone or the watch against the Flipper and the card view
+comes up, the phone showing its own "success" screen as with a real gate.
+
+Two things differ from a plastic card and are handled by the app:
+
+- The emulated card answers on ISO 14443-4A with an empty ATS, where plastic
+  Calypso cards are ISO 14443-4B. The Calypso reader picks its transport at
+  runtime, and a type A card with no historical bytes is routed to the Calypso
+  parser instead of being reported as an unknown card.
+- Only ISO 7816 addressing is available, so the application is selected by AID.
+  Three candidates are tried in order: the Calypso RID, the full Navigo AID, and
+  the `1TIC.ICA` DF name. A type A card with none of them is a card without a
+  Calypso application, and the read stops with an error.
+
+Express mode must be on for the card to answer while the phone is locked, which
+is the default for Navigo.
+
+## RAM budget
+
+The Flipper has little free heap, and both the app binary and the loaded parser
+plugin are resident while a card is read. When RAM runs out the read fails with
+"Not Enough Memory", most often with the USB CLI connected at the same time.
+
+Two things keep the footprint down, and are worth preserving when adding a card:
+
+- Per-card artwork belongs to its plugin, not to the app. The 142 Suica icons
+  live in `images_suica/` and are compiled into the Suica plugin through its own
+  `fap_icon_assets`, so they are only resident while that plugin runs. The app
+  binary went from 89 KB to 61.5 KB this way.
+- Plugin sources are not compiled into the app binary.
+
+When debugging on device, prefer `log info` to `log debug` on the CLI: at debug
+level the Calypso parser prints one line per APDU over USB, which slows the
+poller enough to lose the card.
+
+## Navigo network mapping
+
+Station names come from the CSV files shipped in `files/navigo/stations/`, keyed
+by the sector and station ids found in the event records.
+
+Line names are a different story. The Ile-de-France Intercode route numbers are
+not published and are not an encoding of the commercial line name: RER A is
+recorded as 17 at Auber and as 26 at Neuilly-Plaisance, tram T3a as both 1 and
+13. `NAVIGO_LINE_NAMES` in `api/calypso/transit/navigo.c` therefore holds
+confirmed observations only. An unknown tram or train code is displayed raw, for
+example `Train (line 21)`, rather than guessed; metro and bus codes do match the
+commercial numbering, with the metro "bis" lines offset by 100.
+
+Contributions to that table are welcome. Save a scan made right after a trip on
+a line you can identify with certainty, ideally validated at a station served by
+a single line, then run:
+
+```
+python3 tools/navigo_decode.py <save.nfc>
+```
+
+It prints the raw Intercode fields of each event next to the line the app would
+display, so the transport type and route number to add to the table can be read
+off directly.
+
+---
+
 # Credits
 - **App Author:** [@luu176](https://github.com/luu176)
 - **Info Slaves:** [@equipter](https://github.com/equipter), [@TheDingo8MyBaby](https://github.com/thedingo8mybaby), [@ry4000](https://github.com/ry4000), [@WillyJL](https://github.com/WillyJL), 
