@@ -23,7 +23,15 @@ const char* get_navigo_sncf_train_line(int station_group_id);
 
 const char* get_navigo_sncf_station(int station_group_id, int station_id);
 
-const char* get_navigo_tram_line(int route_number);
+/* One commercial line name for an (EventCode transport type, EventRouteNumber)
+ * pair. Add confirmed observations to NAVIGO_LINE_NAMES in navigo.c. */
+typedef struct {
+    int transport_type;
+    int route_number;
+    const char* line;
+} NavigoLineName;
+
+const char* get_navigo_line_name(int transport_type, int route_number, bool route_available);
 
 typedef enum {
     NAVIGO_PROVIDER_SNCF = 2,

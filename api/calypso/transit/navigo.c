@@ -52,6 +52,8 @@ const char* get_navigo_tariff(int tariff) {
         return "Paris-Visite"; // Theoric
     case 0x1000:
         return "Navigo Liberte+";
+    case 0x1001:
+        return "Navigo Liberte+";
     case 0x4000:
         return "Navigo Mois 75%%";
     case 0x4001:
@@ -385,23 +387,71 @@ char* get_navigo_train_sector(int station_group_id) {
     return strdup(station_name);
 }
 
-const char* get_navigo_tram_line(int route_number) {
-    switch(route_number) {
-    case 1:
-    case 13:
-        return "T3a";
-    case 9:
-        return "T9";
-    case 16:
-        return "T6";
-    case 18:
-        return "T8";
-    default: {
-        // Use static buffer to avoid memory leak
-        static char line[8];
-        snprintf(line, sizeof(line), "?%d?", route_number);
-        return line;
+/* Commercial line names per EventRouteNumber, for Ile-de-France.
+ *
+ * The Intercode route numbers used in Ile-de-France are not published and are
+ * not a straight encoding of the commercial name: RER A is recorded as 17 at
+ * Auber and as 26 at Neuilly-Plaisance, tram T3a as both 1 and 13. So the
+ * mapping is a table of confirmed observations, not arithmetic; a code that is
+ * not in it is printed raw (see get_navigo_line_name) rather than turned into
+ * a wrong line name.
+ *
+ * Metro codes match the commercial number for lines 1-14, with the "bis" lines
+ * offset by 100 (3 bis = 103), so they are handled by the fallback. */
+static const NavigoLineName NAVIGO_LINE_NAMES[] = {
+    /* Train / RER */
+    {COMMUTER_TRAIN, 17, "RER A"}, // observed at Auber
+    {COMMUTER_TRAIN, 26, "RER A"}, // observed at Neuilly-Plaisance
+    /* Metro */
+    {METRO, 103, "Metro 3 bis"},
+    {METRO, 107, "Metro 7 bis"},
+    /* Tram */
+    {TRAM, 1, "Tram T3a"},
+    {TRAM, 9, "Tram T9"},
+    {TRAM, 13, "Tram T3a"},
+    {TRAM, 16, "Tram T6"},
+    {TRAM, 18, "Tram T8"},
+};
+
+const char* get_navigo_line_name(int transport_type, int route_number, bool route_available) {
+    // Buffer for the fallbacks below: "Interurban Bus" + " (line 65535)".
+    static char line[40];
+
+    if(!route_available) {
+        return get_intercode_string_transport_type(transport_type);
     }
+
+    for(size_t i = 0; i < COUNT_OF(NAVIGO_LINE_NAMES); i++) {
+        if(NAVIGO_LINE_NAMES[i].transport_type == transport_type &&
+           NAVIGO_LINE_NAMES[i].route_number == route_number) {
+            return NAVIGO_LINE_NAMES[i].line;
+        }
+    }
+
+    switch(transport_type) {
+    case METRO:
+        // Metro line numbers are the commercial ones (1-14).
+        snprintf(line, sizeof(line), "Metro %d", route_number);
+        return line;
+    case URBAN_BUS:
+    case INTERURBAN_BUS:
+        // Bus route numbers are the commercial ones too.
+        snprintf(
+            line,
+            sizeof(line),
+            "%s %d",
+            get_intercode_string_transport_type(transport_type),
+            route_number);
+        return line;
+    default:
+        // Tram and train: an unknown code is shown as-is, never guessed.
+        snprintf(
+            line,
+            sizeof(line),
+            "%s (line %d)",
+            get_intercode_string_transport_type(transport_type),
+            route_number);
+        return line;
     }
 }
 
@@ -425,35 +475,12 @@ void show_navigo_event_info(
 
     if(event->transport_type == URBAN_BUS || event->transport_type == INTERURBAN_BUS ||
        event->transport_type == METRO || event->transport_type == TRAM) {
-        if(event->route_number_available) {
-            if(event->transport_type == METRO && event->route_number == 103) {
-                furi_string_cat_printf(
-                    parsed_data,
-                    "%s 3 bis\n%s\n",
-                    get_intercode_string_transport_type(event->transport_type),
-                    get_intercode_string_transition_type(event->transition));
-            } else if(event->transport_type == TRAM) {
-                furi_string_cat_printf(
-                    parsed_data,
-                    "%s %s\n%s\n",
-                    get_intercode_string_transport_type(event->transport_type),
-                    get_navigo_tram_line(event->route_number),
-                    get_intercode_string_transition_type(event->transition));
-            } else {
-                furi_string_cat_printf(
-                    parsed_data,
-                    "%s %d\n%s\n",
-                    get_intercode_string_transport_type(event->transport_type),
-                    event->route_number,
-                    get_intercode_string_transition_type(event->transition));
-            }
-        } else {
-            furi_string_cat_printf(
-                parsed_data,
-                "%s\n%s\n",
-                get_intercode_string_transport_type(event->transport_type),
-                get_intercode_string_transition_type(event->transition));
-        }
+        furi_string_cat_printf(
+            parsed_data,
+            "%s\n%s\n",
+            get_navigo_line_name(
+                event->transport_type, event->route_number, event->route_number_available),
+            get_intercode_string_transition_type(event->transition));
         furi_string_cat_printf(
             parsed_data,
             "Transporter: %s\n",
@@ -486,19 +513,12 @@ void show_navigo_event_info(
         locale_format_datetime_cat(parsed_data, &event->date, true);
         furi_string_cat_printf(parsed_data, "\n");
     } else if(event->transport_type == COMMUTER_TRAIN) {
-        if(event->route_number_available) {
-            furi_string_cat_printf(
-                parsed_data,
-                "RER %c\n%s\n",
-                (65 + event->route_number - 16),
-                get_intercode_string_transition_type(event->transition));
-        } else {
-            furi_string_cat_printf(
-                parsed_data,
-                "%s\n%s\n",
-                get_intercode_string_transport_type(event->transport_type),
-                get_intercode_string_transition_type(event->transition));
-        }
+        furi_string_cat_printf(
+            parsed_data,
+            "%s\n%s\n",
+            get_navigo_line_name(
+                event->transport_type, event->route_number, event->route_number_available),
+            get_intercode_string_transition_type(event->transition));
         furi_string_cat_printf(
             parsed_data,
             "Transporter: %s\n",
@@ -580,35 +600,12 @@ void show_navigo_special_event_info(NavigoCardSpecialEvent* event, FuriString* p
 
     if(event->transport_type == URBAN_BUS || event->transport_type == INTERURBAN_BUS ||
        event->transport_type == METRO || event->transport_type == TRAM) {
-        if(event->route_number_available) {
-            if(event->transport_type == METRO && event->route_number == 103) {
-                furi_string_cat_printf(
-                    parsed_data,
-                    "%s 3 bis\n%s\n",
-                    get_intercode_string_transport_type(event->transport_type),
-                    get_intercode_string_transition_type(event->transition));
-            } else if(event->transport_type == TRAM) {
-                furi_string_cat_printf(
-                    parsed_data,
-                    "%s %s\n%s\n",
-                    get_intercode_string_transport_type(event->transport_type),
-                    get_navigo_tram_line(event->route_number),
-                    get_intercode_string_transition_type(event->transition));
-            } else {
-                furi_string_cat_printf(
-                    parsed_data,
-                    "%s %d\n%s\n",
-                    get_intercode_string_transport_type(event->transport_type),
-                    event->route_number,
-                    get_intercode_string_transition_type(event->transition));
-            }
-        } else {
-            furi_string_cat_printf(
-                parsed_data,
-                "%s\n%s\n",
-                get_intercode_string_transport_type(event->transport_type),
-                get_intercode_string_transition_type(event->transition));
-        }
+        furi_string_cat_printf(
+            parsed_data,
+            "%s\n%s\n",
+            get_navigo_line_name(
+                event->transport_type, event->route_number, event->route_number_available),
+            get_intercode_string_transition_type(event->transition));
         furi_string_cat_printf(
             parsed_data, "Result: %s\n", get_intercode_string_event_result(event->result));
         furi_string_cat_printf(
@@ -622,19 +619,12 @@ void show_navigo_special_event_info(NavigoCardSpecialEvent* event, FuriString* p
         locale_format_datetime_cat(parsed_data, &event->date, true);
         furi_string_cat_printf(parsed_data, "\n");
     } else if(event->transport_type == COMMUTER_TRAIN) {
-        if(event->route_number_available) {
-            furi_string_cat_printf(
-                parsed_data,
-                "RER %c\n%s\n",
-                (65 + event->route_number - 16),
-                get_intercode_string_transition_type(event->transition));
-        } else {
-            furi_string_cat_printf(
-                parsed_data,
-                "%s\n%s\n",
-                get_intercode_string_transport_type(event->transport_type),
-                get_intercode_string_transition_type(event->transition));
-        }
+        furi_string_cat_printf(
+            parsed_data,
+            "%s\n%s\n",
+            get_navigo_line_name(
+                event->transport_type, event->route_number, event->route_number_available),
+            get_intercode_string_transition_type(event->transition));
         furi_string_cat_printf(
             parsed_data, "Result: %s\n", get_intercode_string_event_result(event->result));
         furi_string_cat_printf(
