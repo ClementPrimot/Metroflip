@@ -153,6 +153,15 @@ static NfcCommand
             app->hist_bytes_count >= 2 && app->hist_bytes[0] == 0x04 &&
             app->hist_bytes[1] == 0x09) {
             app->card_type = "tmoney";
+        } else if(app->hist_bytes_count == 0) {
+            /* An empty ATS means a phone-emulated card (Apple/Google Wallet):
+               there are no historical bytes to identify it by, and a Calypso
+               applet such as Navigo is emulated on type A rather than type B.
+               Hand it to the Calypso plugin, which selects the application by
+               AID and reports a read error if there is none. */
+            FURI_LOG_I(TAG, "Empty ATS, trying Calypso over ISO14443-4A");
+            app->card_type = "calypso";
+            app->calypso_iso14443_4a = true;
         } else {
             app->card_type = "atr";
         }
@@ -190,6 +199,7 @@ void metroflip_scene_auto_on_enter(void* context) {
     dolphin_deed(DolphinDeedNfcRead);
 
     app->sec_num = 0;
+    app->calypso_iso14443_4a = false;
     /* app->poller may be a stale pointer left over from a previous plugin's
        poller (freed in its on_exit). This scene owns the slot from here on. */
     app->poller = NULL;

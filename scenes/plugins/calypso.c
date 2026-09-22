@@ -7,23 +7,63 @@
 #include "../../api/metroflip/metroflip_api.h"
 #include "../../metroflip_plugins.h"
 
+#include <nfc/protocols/iso14443_4a/iso14443_4a_poller.h>
 #include <nfc/protocols/iso14443_4b/iso14443_4b_poller.h>
 
 #define TAG "Metroflip:Scene:Calypso"
 
 bool beginning = true;
 
-// SELECT APPLICATION by partial AID (Calypso RID) - used when CLA 0x94 is rejected
+/* Calypso APDUs travel over ISO 14443-4 blocks. Plastic Calypso cards are
+ * type B, but phone-emulated ones (Navigo in Apple/Google Wallet) come up as
+ * type A, so the block transport is picked at runtime: exactly one of the two
+ * pollers is set. A NULL transport means file-replay mode (nothing is sent). */
+typedef struct {
+    Iso14443_4aPoller* a;
+    Iso14443_4bPoller* b;
+} CalypsoTransport;
+
+static int calypso_send(CalypsoTransport* transport, BitBuffer* tx, BitBuffer* rx) {
+    furi_assert(transport);
+    if(transport->a) {
+        return iso14443_4a_poller_send_block(transport->a, tx, rx);
+    }
+    return iso14443_4b_poller_send_block(transport->b, tx, rx);
+}
+
+/* SELECT APPLICATION by name (ISO 7816), tried in order when native CLA 0x94
+ * addressing is not available. Emulated cards only answer the ISO 7816 form,
+ * and some of them only match the full AID or the "1TIC.ICA" DF name rather
+ * than the bare RID. */
+typedef struct {
+    const char* name;
+    const uint8_t* apdu;
+    size_t length;
+} CalypsoAidSelect;
+
+// Partial AID (Calypso RID) - works for most plastic Calypso cards
 static const uint8_t calypso_aid_select[] = {
     0x00, 0xA4, 0x04, 0x00, 0x05, // CLA=00 INS=A4 P1=04(by name) P2=00 Lc=05
     0xA0, 0x00, 0x00, 0x04, 0x04  // Calypso RID
 };
 
-// SELECT APPLICATION by full Navigo AID - for new Navigo variants that reject partial AID
+// Full Navigo AID - for new Navigo variants that reject the partial AID
 static const uint8_t calypso_navigo_aid_select[] = {
     0x00, 0xA4, 0x04, 0x00, 0x0A, // CLA=00 INS=A4 P1=04(by name) P2=00 Lc=0A
     0xA0, 0x00, 0x00, 0x04, 0x04, // Calypso RID
     0x01, 0x25, 0x09, 0x01, 0x01  // Navigo PIX
+};
+
+// Calypso DF name "1TIC.ICA" - the historic Calypso application name
+static const uint8_t calypso_1tic_aid_select[] = {
+    0x00, 0xA4, 0x04, 0x00, 0x08,                  // CLA=00 INS=A4 P1=04(by name) P2=00 Lc=08
+    0x31, 0x54, 0x49, 0x43, 0x2E, 0x49, 0x43, 0x41 // "1TIC.ICA"
+};
+
+static const CalypsoAidSelect calypso_aid_selects[] = {
+    {"Calypso RID", calypso_aid_select, sizeof(calypso_aid_select)},
+    {"Navigo AID", calypso_navigo_aid_select, sizeof(calypso_navigo_aid_select)},
+    {"1TIC.ICA", calypso_1tic_aid_select, sizeof(calypso_1tic_aid_select)},
 };
 
 char* build_hex_string(BitBuffer* rx_buffer) {
@@ -89,7 +129,7 @@ int select_new_app(
     int new_app,
     BitBuffer* tx_buffer,
     BitBuffer* rx_buffer,
-    Iso14443_4bPoller* iso14443_4b_poller,
+    CalypsoTransport* transport,
     Metroflip* app,
     MetroflipPollerEventType* stage) {
     if(!app->data_loaded) {
@@ -110,9 +150,9 @@ int select_new_app(
             select_app[5],
             select_app[6],
             select_app[7]);
-        int error = iso14443_4b_poller_send_block(iso14443_4b_poller, tx_buffer, rx_buffer);
-        if(error != Iso14443_4bErrorNone) {
-            FURI_LOG_I(TAG, "Select File: iso14443_4b_poller_send_block error %d", error);
+        int error = calypso_send(transport, tx_buffer, rx_buffer);
+        if(error != 0) {
+            FURI_LOG_I(TAG, "Select File: calypso_send error %d", error);
             *stage = MetroflipPollerEventTypeFail;
             view_dispatcher_send_custom_event(
                 app->view_dispatcher, MetroflipCustomEventPollerFail);
@@ -128,7 +168,7 @@ int read_new_file(
     int new_file,
     BitBuffer* tx_buffer,
     BitBuffer* rx_buffer,
-    Iso14443_4bPoller* iso14443_4b_poller,
+    CalypsoTransport* transport,
     Metroflip* app,
     MetroflipPollerEventType* stage) {
     if(!app->data_loaded) {
@@ -145,10 +185,9 @@ int read_new_file(
             read_file[2],
             read_file[3],
             read_file[4]);
-        Iso14443_4bError error =
-            iso14443_4b_poller_send_block(iso14443_4b_poller, tx_buffer, rx_buffer);
-        if(error != Iso14443_4bErrorNone) {
-            FURI_LOG_I(TAG, "Read File: iso14443_4b_poller_send_block error %d", error);
+        int error = calypso_send(transport, tx_buffer, rx_buffer);
+        if(error != 0) {
+            FURI_LOG_I(TAG, "Read File: calypso_send error %d", error);
             *stage = MetroflipPollerEventTypeFail;
             view_dispatcher_send_custom_event(
                 app->view_dispatcher, MetroflipCustomEventPollerFail);
@@ -439,13 +478,13 @@ static void calypso_display_card_view(Metroflip* app) {
     metroflip_card_view_show(app);
 }
 
-/* Run the full Calypso read/parse flow. In live mode (iso14443_4b_poller
+/* Run the full Calypso read/parse flow. In live mode (transport
  * != NULL) APDUs are exchanged with the card; in file-replay mode
  * (app->data_loaded, poller == NULL) every send is skipped and records are
  * read back from the saved file instead. On success the parsed card is
  * stored in app->calypso_context. Runs on the poller thread in live mode,
  * so it must never touch the UI. */
-static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_poller) {
+static bool calypso_read_card(Metroflip* app, CalypsoTransport* transport) {
     MetroflipPollerEventType stage = MetroflipPollerEventTypeStart;
 
     BitBuffer* tx_buffer = bit_buffer_alloc(Metroflip_POLLER_MAX_BUFFER_SIZE);
@@ -453,10 +492,12 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 
     if(!app->data_loaded) {
         nfc_device_set_data(
-            app->nfc_device, NfcProtocolIso14443_4b, nfc_poller_get_data(app->poller));
+            app->nfc_device,
+            transport->a ? NfcProtocolIso14443_4a : NfcProtocolIso14443_4b,
+            nfc_poller_get_data(app->poller));
     }
 
-    Iso14443_4bError error;
+    int error;
     size_t response_length = 0;
     CalypsoCardData* card = NULL;
 
@@ -483,49 +524,37 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                 if(!app->data_loaded) {
                     bool aid_selected = false;
 
-                    // 1. Try partial AID (RID only) - works for most Calypso cards
-                    bit_buffer_reset(tx_buffer);
-                    bit_buffer_reset(rx_buffer);
-                    bit_buffer_append_bytes(
-                        tx_buffer, calypso_aid_select, sizeof(calypso_aid_select));
-                    error = iso14443_4b_poller_send_block(
-                        iso14443_4b_poller, tx_buffer, rx_buffer);
-                    if(error == Iso14443_4bErrorNone) {
-                        response_length = bit_buffer_get_size_bytes(rx_buffer);
-                        if(response_length >= 2 &&
-                           bit_buffer_get_byte(rx_buffer, response_length - 2) ==
-                               apdu_success[0] &&
-                           bit_buffer_get_byte(rx_buffer, response_length - 1) ==
-                               apdu_success[1]) {
-                            FURI_LOG_I(TAG, "Calypso AID selected, using ISO 7816 mode");
-                            aid_selected = true;
-                        }
-                    }
-
-                    // 2. If RID select failed, try full Navigo AID for new card variants
-                    if(!aid_selected) {
-                        FURI_LOG_I(
-                            TAG, "RID select failed, trying full Navigo AID");
+                    for(size_t i = 0; i < COUNT_OF(calypso_aid_selects) && !aid_selected; i++) {
+                        const CalypsoAidSelect* aid = &calypso_aid_selects[i];
                         bit_buffer_reset(tx_buffer);
                         bit_buffer_reset(rx_buffer);
-                        bit_buffer_append_bytes(
-                            tx_buffer,
-                            calypso_navigo_aid_select,
-                            sizeof(calypso_navigo_aid_select));
-                        error = iso14443_4b_poller_send_block(
-                            iso14443_4b_poller, tx_buffer, rx_buffer);
-                        if(error == Iso14443_4bErrorNone) {
-                            response_length = bit_buffer_get_size_bytes(rx_buffer);
-                            if(response_length >= 2 &&
-                               bit_buffer_get_byte(rx_buffer, response_length - 2) ==
-                                   apdu_success[0] &&
-                               bit_buffer_get_byte(rx_buffer, response_length - 1) ==
-                                   apdu_success[1]) {
-                                FURI_LOG_I(
-                                    TAG,
-                                    "Full Navigo AID selected, using ISO 7816 mode");
-                                aid_selected = true;
-                            }
+                        bit_buffer_append_bytes(tx_buffer, aid->apdu, aid->length);
+                        error = calypso_send(transport, tx_buffer, rx_buffer);
+                        if(error != 0) {
+                            FURI_LOG_I(TAG, "%s select: transport error %d", aid->name, error);
+                            continue;
+                        }
+                        response_length = bit_buffer_get_size_bytes(rx_buffer);
+                        if(response_length < 2) {
+                            FURI_LOG_I(
+                                TAG,
+                                "%s select: short response (%zu)",
+                                aid->name,
+                                response_length);
+                        } else if(
+                            bit_buffer_get_byte(rx_buffer, response_length - 2) ==
+                                apdu_success[0] &&
+                            bit_buffer_get_byte(rx_buffer, response_length - 1) ==
+                                apdu_success[1]) {
+                            FURI_LOG_I(TAG, "%s selected, using ISO 7816 mode", aid->name);
+                            aid_selected = true;
+                        } else {
+                            FURI_LOG_I(
+                                TAG,
+                                "%s select refused: SW %02X%02X",
+                                aid->name,
+                                bit_buffer_get_byte(rx_buffer, response_length - 2),
+                                bit_buffer_get_byte(rx_buffer, response_length - 1));
                         }
                     }
 
@@ -533,6 +562,16 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                         select_app[0] = 0x00;
                         select_app[2] = 0x09; // P1: select from current DF
                         read_file[0] = 0x00;
+                    } else if(transport->a) {
+                        /* Type A here means a phone-emulated card, which only
+                         * speaks ISO 7816: with no Calypso application to
+                         * select there is nothing to read, and the native
+                         * CLA 0x94 path below would only trade error frames. */
+                        FURI_LOG_I(TAG, "No Calypso application on this ISO14443-4A card");
+                        stage = MetroflipPollerEventTypeFail;
+                        view_dispatcher_send_custom_event(
+                            app->view_dispatcher, MetroflipCustomEventPollerFileNotFound);
+                        break;
                     }
                 }
 
@@ -548,7 +587,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                  */
                 card->card_number = 0;
                 error = select_new_app(
-                    0x00, 0x02, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                    0x00, 0x02, tx_buffer, rx_buffer, transport, app, &stage);
                 if(error != 0) {
                     break; // transport-level failure (e.g. card removed)
                 }
@@ -565,7 +604,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                 if(icc_present) {
                     // Send the read command for ICC
                     error = read_new_file(
-                        "0002", "01", 0x01, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                        "0002", "01", 0x01, tx_buffer, rx_buffer, transport, app, &stage);
                     if(error != 0) {
                         // Live: transport failure -> give up. File replay: the
                         // 0002 record is simply absent -> skip, serial stays 0.
@@ -613,7 +652,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                 // selects fine from the current DF). The SW is checked inline so a
                 // missing child does not post a spurious "wrong card" event.
                 error = select_new_app(
-                    0x20, 0x00, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                    0x20, 0x00, tx_buffer, rx_buffer, transport, app, &stage);
                 if(error != 0) {
                     FURI_LOG_E(TAG, "Failed to select app for ticketing");
                     break; // transport-level failure (e.g. card removed)
@@ -632,7 +671,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 
                 // Select app for environment
                 error = select_new_app(
-                    0x20, 0x1, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                    0x20, 0x1, tx_buffer, rx_buffer, transport, app, &stage);
                 if(error != 0) {
                     break;
                 }
@@ -644,7 +683,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 
                 // read file 1
                 error = read_new_file(
-                    "2001", "01", 1, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                    "2001", "01", 1, tx_buffer, rx_buffer, transport, app, &stage);
 
                 if(error != 0) {
                     view_dispatcher_send_custom_event(
@@ -750,7 +789,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 
                     // Select app for contracts
                     error = select_new_app(
-                        0x20, 0x20, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                        0x20, 0x20, tx_buffer, rx_buffer, transport, app, &stage);
                     if(error != 0) {
                         FURI_LOG_E(TAG, "Failed to select app for contracts");
                         break;
@@ -777,7 +816,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                         snprintf(FID_buf, sizeof(FID_buf), "%02X", i);
                         const char* FID = FID_buf;
                         error = read_new_file(
-                            "2020", FID, i, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                            "2020", FID, i, tx_buffer, rx_buffer, transport, app, &stage);
                         if(error != 0) {
                             view_dispatcher_send_custom_event(
                                 app->view_dispatcher, MetroflipCustomEventPollerFail);
@@ -1036,7 +1075,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 
                     // Select app for counters (remaining tickets on Navigo Easy)
                     error = select_new_app(
-                        0x20, 0x69, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                        0x20, 0x69, tx_buffer, rx_buffer, transport, app, &stage);
                     if(error != 0) {
                         break;
                     }
@@ -1048,7 +1087,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 
                     // read file 1
                     error = read_new_file(
-                        "2069", "01", 1, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                        "2069", "01", 1, tx_buffer, rx_buffer, transport, app, &stage);
                     if(error != 0) {
                         view_dispatcher_send_custom_event(
                             app->view_dispatcher, MetroflipCustomEventPollerFail);
@@ -1094,7 +1133,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 
                     // Select app for events
                     error = select_new_app(
-                        0x20, 0x10, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                        0x20, 0x10, tx_buffer, rx_buffer, transport, app, &stage);
                     if(error != 0) {
                         break;
                     }
@@ -1118,7 +1157,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                         snprintf(FID_buf, sizeof(FID_buf), "%02X", i);
                         const char* FID = FID_buf;
                         error = read_new_file(
-                            "2010", FID, i, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                            "2010", FID, i, tx_buffer, rx_buffer, transport, app, &stage);
                         if(error != 0) {
                             view_dispatcher_send_custom_event(
                                 app->view_dispatcher, MetroflipCustomEventPollerFail);
@@ -1306,7 +1345,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 
                     // Select app for special events
                     error = select_new_app(
-                        0x20, 0x40, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                        0x20, 0x40, tx_buffer, rx_buffer, transport, app, &stage);
                     if(error != 0) {
                         break;
                     }
@@ -1322,7 +1361,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                         snprintf(FID_buf, sizeof(FID_buf), "%02X", i);
                         const char* FID = FID_buf;
                         error = read_new_file(
-                            "2040", FID, i, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                            "2040", FID, i, tx_buffer, rx_buffer, transport, app, &stage);
                         if(error != 0) {
                             view_dispatcher_send_custom_event(
                                 app->view_dispatcher, MetroflipCustomEventPollerFail);
@@ -1579,7 +1618,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 
                     // Select app for contracts
                     error = select_new_app(
-                        0x20, 0x20, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                        0x20, 0x20, tx_buffer, rx_buffer, transport, app, &stage);
                     if(error != 0) {
                         FURI_LOG_E(TAG, "Failed to select app for contracts");
                         break;
@@ -1605,7 +1644,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                         snprintf(FID_buf, sizeof(FID_buf), "%02X", i);
                         const char* FID = FID_buf;
                         error = read_new_file(
-                            "2020", FID, i, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                            "2020", FID, i, tx_buffer, rx_buffer, transport, app, &stage);
                         if(error != 0) {
                             view_dispatcher_send_custom_event(
                                 app->view_dispatcher, MetroflipCustomEventPollerFail);
@@ -1789,7 +1828,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 
                     // Select app for events
                     error = select_new_app(
-                        0x20, 0x10, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                        0x20, 0x10, tx_buffer, rx_buffer, transport, app, &stage);
                     if(error != 0) {
                         break;
                     }
@@ -1812,7 +1851,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                         snprintf(FID_buf, sizeof(FID_buf), "%02X", i);
                         const char* FID = FID_buf;
                         error = read_new_file(
-                            "2010", FID, i, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                            "2010", FID, i, tx_buffer, rx_buffer, transport, app, &stage);
                         if(error != 0) {
                             view_dispatcher_send_custom_event(
                                 app->view_dispatcher, MetroflipCustomEventPollerFail);
@@ -2027,7 +2066,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 
                         //get balance
                         error = select_new_app(
-                            0x20, 0x2A, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                            0x20, 0x2A, tx_buffer, rx_buffer, transport, app, &stage);
                         if(error != 0) {
                             FURI_LOG_E(TAG, "Failed to select app for contracts");
                             break;
@@ -2041,7 +2080,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                         }
 
                         error = read_new_file(
-                            "202A", "01", 1, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                            "202A", "01", 1, tx_buffer, rx_buffer, transport, app, &stage);
                         if(error != 0) {
                             view_dispatcher_send_custom_event(
                                 app->view_dispatcher, MetroflipCustomEventPollerFail);
@@ -2066,7 +2105,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                         card->ravkav->contracts[0].balance = result;
 
                         error = select_new_app(
-                            0x20, 0x20, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                            0x20, 0x20, tx_buffer, rx_buffer, transport, app, &stage);
                         if(error != 0) {
                             FURI_LOG_E(TAG, "Failed to select app for contracts");
                             break;
@@ -2090,7 +2129,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                                 i,
                                 tx_buffer,
                                 rx_buffer,
-                                iso14443_4b_poller,
+                                transport,
                                 app,
                                 &stage);
                             if(error != 0) {
@@ -2320,7 +2359,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                         free_calypso_structure(RavKavContractStructure);
 
                         error = select_new_app(
-                            0x20, 0x01, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                            0x20, 0x01, tx_buffer, rx_buffer, transport, app, &stage);
                         if(error != 0) {
                             FURI_LOG_E(TAG, "Failed to select app for environment");
                             break;
@@ -2345,7 +2384,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                         // Now send the read command for environment
 
                         error = read_new_file(
-                            "2001", "01", 1, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                            "2001", "01", 1, tx_buffer, rx_buffer, transport, app, &stage);
                         if(error != 0) {
                             view_dispatcher_send_custom_event(
                                 app->view_dispatcher, MetroflipCustomEventPollerFail);
@@ -2449,7 +2488,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 
                         // Select app for events
                         error = select_new_app(
-                            0x20, 0x10, tx_buffer, rx_buffer, iso14443_4b_poller, app, &stage);
+                            0x20, 0x10, tx_buffer, rx_buffer, transport, app, &stage);
                         if(error != 0) {
                             break;
                         }
@@ -2477,7 +2516,7 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
                                 i,
                                 tx_buffer,
                                 rx_buffer,
-                                iso14443_4b_poller,
+                                transport,
                                 app,
                                 &stage);
                             if(error != 0) {
@@ -2742,14 +2781,26 @@ static bool calypso_read_card(Metroflip* app, Iso14443_4bPoller* iso14443_4b_pol
 }
 
 static NfcCommand calypso_poller_callback(NfcGenericEvent event, void* context) {
-    furi_assert(event.protocol == NfcProtocolIso14443_4b);
     Metroflip* app = context;
-    const Iso14443_4bPollerEvent* iso14443_4b_event = event.event_data;
 
-    if(iso14443_4b_event->type == Iso14443_4bPollerEventTypeReady) {
+    /* Same read flow over either block transport (see CalypsoTransport). */
+    CalypsoTransport transport = {NULL, NULL};
+    bool ready = false;
+    if(event.protocol == NfcProtocolIso14443_4a) {
+        const Iso14443_4aPollerEvent* iso14443_4a_event = event.event_data;
+        ready = (iso14443_4a_event->type == Iso14443_4aPollerEventTypeReady);
+        transport.a = event.instance;
+    } else {
+        furi_assert(event.protocol == NfcProtocolIso14443_4b);
+        const Iso14443_4bPollerEvent* iso14443_4b_event = event.event_data;
+        ready = (iso14443_4b_event->type == Iso14443_4bPollerEventTypeReady);
+        transport.b = event.instance;
+    }
+
+    if(ready) {
         /* Parse on the poller thread, then hand off to the main thread:
          * the UI must never be built from here. */
-        if(calypso_read_card(app, event.instance)) {
+        if(calypso_read_card(app, &transport)) {
             view_dispatcher_send_custom_event(
                 app->view_dispatcher, MetroflipCustomEventPollerSuccess);
         }
@@ -2786,7 +2837,11 @@ static void calypso_on_enter(Metroflip* app) {
         popup_set_icon(popup, 0, 3, &I_RFIDDolphinReceive_97x61);
         view_dispatcher_switch_to_view(app->view_dispatcher, MetroflipViewPopup);
 
-        app->poller = nfc_poller_alloc(app->nfc, NfcProtocolIso14443_4b);
+        /* Phone-emulated Calypso (Navigo in Apple/Google Wallet) answers on
+         * type A; plastic cards on type B. The auto scene sets the flag. */
+        app->poller = nfc_poller_alloc(
+            app->nfc,
+            app->calypso_iso14443_4a ? NfcProtocolIso14443_4a : NfcProtocolIso14443_4b);
         nfc_poller_start(app->poller, calypso_poller_callback, app);
         metroflip_app_blink_start(app);
     }

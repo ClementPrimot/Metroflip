@@ -102,6 +102,9 @@ typedef struct Metroflip {
     bool is_desfire;
     uint8_t hist_bytes[32];
     uint32_t hist_bytes_count;
+    /* Read Calypso over ISO14443-4A instead of -4B: phone-emulated cards
+       (Navigo in Apple/Google Wallet) answer on type A. */
+    bool calypso_iso14443_4a;
 
 
     // Calypso specific context

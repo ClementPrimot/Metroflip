@@ -93,6 +93,7 @@ Metroflip* metroflip_alloc() {
     view_dispatcher_add_view(app->view_dispatcher, MetroflipViewLoading, app->scan_anim);
 
     app->data_loaded = false;
+    app->calypso_iso14443_4a = false;
     app->card_view = NULL;
     return app;
 }
