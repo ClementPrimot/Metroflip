@@ -3,6 +3,9 @@ App(
     name="Metroflip",
     apptype=FlipperAppType.EXTERNAL,
     entry_point="metroflip",
+    # Plugins are built as separate .fal targets below; compiling them into the
+    # app too only wasted build time (and pulled their icon bundles in).
+    sources=["*.c*", "!plugins"],
     stack_size=4 * 1024,
     fap_category="NFC",
     fap_version="2.0",
@@ -118,6 +121,10 @@ App(
     entry_point="suica_plugin_ep",
     requires=["metroflip"],
     sources=["scenes/plugins/suica.c"],
+    # The 142 Suica icons live here rather than in the app's images/ so they
+    # are only resident in RAM while the Suica plugin itself is loaded.
+    fap_icon_assets="images_suica",
+    fap_icon_assets_symbol="suica",
     fal_embedded=True,
 )
 

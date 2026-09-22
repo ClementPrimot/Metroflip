@@ -3,6 +3,9 @@
 #include "metroflip_i.h"
 #include <flipper_application.h>
 #include "../metroflip/metroflip_api.h"
+/* Icon bundle compiled into the Suica plugin itself (images_suica/), so the
+ * main app does not keep 26 KB of Suica artwork resident. */
+#include "suica_icons.h"
 #include "suica_assets.h"
 
 #include <lib/nfc/protocols/felica/felica.h>
