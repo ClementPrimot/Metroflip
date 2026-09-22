@@ -5,7 +5,9 @@ App(
     entry_point="metroflip",
     # Plugins are built as separate .fal targets below; compiling them into the
     # app too only wasted build time (and pulled their icon bundles in).
-    sources=["*.c*", "!plugins"],
+    # "tools" is excluded because the "*.c*" glob also matches Python bytecode
+    # (*.cpython-*.pyc), which the linker then chokes on.
+    sources=["*.c*", "!plugins", "!tools"],
     stack_size=4 * 1024,
     fap_category="NFC",
     fap_version="2.0",
